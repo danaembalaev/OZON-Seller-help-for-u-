@@ -5,6 +5,7 @@ from io import BytesIO
 from openpyxl import load_workbook
 from openpyxl.styles import Font, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
+import re
 
 DEFAULT_STATUS = "Ожидает отгрузки"
 SHEET_NAME = "Основной список"
@@ -29,19 +30,18 @@ PAGE = """
   </style>
 </head>
 <body>
-  <h1>Ozon CSV → «Основной список» (Excel под печать)</h1>
+  <h1>Загрузка отчёта → «Основной список» (Excel под печать)</h1>
   <div class="card">
     <div class="row">
+      <span class="pill">Форматы: CSV / Excel</span>
       <span class="pill">Статус: Ожидает отгрузки</span>
-      <span class="pill">Лист: Основной список</span>
     </div>
     <p class="muted">
-      Группирует по <b>Артикулу</b>, суммирует количество, добавляет пометки вида <b>8(2в одну, 3в одну)</b>
-      только если в исходных строках встречались количества &gt; 1.
-      Внизу добавляет только те отправления, где в одной отправке несколько артикулов (без номеров).
+      Можно загрузить <b>CSV</b> или <b>Excel</b> (xlsx/xls).
+      Сервис сам попробует распознать нужные колонки даже если они названы чуть иначе.
     </p>
     <form action="/convert" method="post" enctype="multipart/form-data">
-      <p><input type="file" name="file" accept=".csv" required></p>
+      <p><input type="file" name="file" required></p>
       <p><button type="submit">Скачать Excel</button></p>
     </form>
   </div>
@@ -56,6 +56,69 @@ def read_csv_smart(content: bytes) -> pd.DataFrame:
         except Exception:
             continue
     return pd.read_csv(BytesIO(content), sep=";", engine="python")
+
+def read_table_smart(filename: str, content: bytes) -> pd.DataFrame:
+    name = (filename or "").lower()
+
+    if name.endswith(".csv"):
+        return read_csv_smart(content)
+
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        bio = BytesIO(content)
+        return pd.read_excel(bio)
+
+    try:
+        return read_csv_smart(content)
+    except Exception:
+        raise ValueError("Неподдерживаемый формат. Загрузите CSV или Excel (.xlsx/.xls).")
+
+def _norm(s: str) -> str:
+    s = (s or "").strip().lower().replace("ё", "е")
+    s = re.sub(r"[\s\-_]+", " ", s)
+    s = re.sub(r"[^0-9a-zа-я ]+", "", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    return s
+
+def _pick_col(df: pd.DataFrame, variants: list[str]) -> str | None:
+    norm_map = {_norm(c): c for c in df.columns}
+    for v in variants:
+        nv = _norm(v)
+        if nv in norm_map:
+            return norm_map[nv]
+    for c in df.columns:
+        nc = _norm(c)
+        for v in variants:
+            nv = _norm(v)
+            if nv and nv in nc:
+                return c
+    return None
+
+def ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
+    status_variants = ["Статус", "Статус заказа", "State", "Status"]
+    article_variants = ["Артикул", "Артикул продавца", "Артикул товара", "Vendor code", "Vendor", "Offer id", "Offer_id"]
+    qty_variants = ["Количество", "Кол-во", "Кол во", "Кол-во товара", "Qty", "Quantity"]
+    ship_variants = ["Номер отправления", "Отправление", "Номер постинга", "Posting number", "Shipment", "Shipment number"]
+
+    c_status = _pick_col(df, status_variants)
+    c_art = _pick_col(df, article_variants)
+    c_qty = _pick_col(df, qty_variants)
+    c_ship = _pick_col(df, ship_variants)
+
+    missing = []
+    if not c_status: missing.append("Статус")
+    if not c_art: missing.append("Артикул")
+    if not c_qty: missing.append("Количество")
+    if not c_ship: missing.append("Номер отправления")
+
+    if missing:
+        raise ValueError("В файле не найдены нужные колонки: " + ", ".join(missing))
+
+    return df.rename(columns={
+        c_status: "Статус",
+        c_art: "Артикул",
+        c_qty: "Количество",
+        c_ship: "Номер отправления",
+    }).copy()
 
 def build_note(qtys: pd.Series) -> str:
     bigger = sorted({int(q) for q in qtys.dropna() if int(q) > 1})
@@ -150,13 +213,12 @@ def index():
 @app.post("/convert")
 async def convert(file: UploadFile = File(...)):
     content = await file.read()
-    df = read_csv_smart(content)
 
-    required = {"Статус", "Артикул", "Количество", "Номер отправления"}
-    missing = required - set(df.columns)
-    if missing:
-        msg = "В CSV не хватает колонок: " + ", ".join(sorted(missing))
-        return HTMLResponse(f"<h3>{msg}</h3>", status_code=400)
+    try:
+        df = read_table_smart(file.filename, content)
+        df = ensure_required_columns(df)
+    except ValueError as e:
+        return HTMLResponse(f"<h3>{e}</h3>", status_code=400)
 
     df_ready = df[df["Статус"] == DEFAULT_STATUS].copy()
     df_ready["Количество"] = pd.to_numeric(df_ready["Количество"], errors="coerce").fillna(0).astype(int)
@@ -168,7 +230,6 @@ async def convert(file: UploadFile = File(...)):
     formatted = format_as_osnovnoi_spisok(xlsx_io.getvalue())
 
     filename = "Osnovnoi_spisok.xlsx"
-  
     return StreamingResponse(
         BytesIO(formatted),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
