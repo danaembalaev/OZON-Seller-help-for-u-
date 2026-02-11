@@ -167,7 +167,8 @@ async def convert(file: UploadFile = File(...)):
     final_df.to_excel(xlsx_io, index=False)
     formatted = format_as_osnovnoi_spisok(xlsx_io.getvalue())
 
-    filename = "Основной_список.xlsx"
+    filename = "Osnovnoi_spisok.xlsx"
+  
     return StreamingResponse(
         BytesIO(formatted),
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
